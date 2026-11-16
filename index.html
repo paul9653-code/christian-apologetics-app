@@ -556,176 +556,175 @@
     }
 
     // =========================================================================
-    // 4. Optional Live Gemini API Call (With Auto-Model Discovery & Fallback)
+    // 4. Gemini API Call — 자동 모델 감지 + JSON 모드 없이도 동작하는 견고한 버전
     // =========================================================================
-    async function detectAndValidateGeminiModel(apiKey) {
+
+    // 구글 API에서 이 계정이 쓸 수 있는 generateContent 지원 모델을 조회
+    async function detectAvailableModel(apiKey) {
       const key = (apiKey || "").trim();
-      if (!key) return null;
+      const listUrl = `https://generativelanguage.googleapis.com/v1beta/models?key=${encodeURIComponent(key)}`;
+      const res = await fetch(listUrl);
 
-      const versions = ["v1beta", "v1"];
-      let lastErrMsg = "";
-
-      for (const ver of versions) {
-        try {
-          const listUrl = `https://generativelanguage.googleapis.com/${ver}/models?key=${encodeURIComponent(key)}`;
-          const res = await fetch(listUrl);
-          if (res.ok) {
-            const data = await res.json();
-            const models = data.models || [];
-            const usable = models.filter(m => Array.isArray(m.supportedGenerationMethods) && m.supportedGenerationMethods.includes("generateContent"));
-
-            // 선호도 순: 2.0-flash > 1.5-flash > flash > 2.0 > 1.5-pro > gemini-pro > 아무 모델
-            const patterns = [
-              /2\.0-flash/i,
-              /1\.5-flash/i,
-              /flash/i,
-              /2\.0/i,
-              /1\.5-pro/i,
-              /gemini-pro/i,
-              /gemini/i
-            ];
-
-            for (const p of patterns) {
-              const found = usable.find(m => p.test(m.name));
-              if (found) {
-                return {
-                  apiVersion: ver,
-                  modelName: found.name.replace(/^models\//, ""),
-                  displayName: found.displayName || found.name
-                };
-              }
-            }
-
-            if (usable.length > 0) {
-              return {
-                apiVersion: ver,
-                modelName: usable[0].name.replace(/^models\//, ""),
-                displayName: usable[0].displayName || usable[0].name
-              };
-            }
-          } else {
-            const errJson = await res.json().catch(() => null);
-            lastErrMsg = errJson?.error?.message || `HTTP ${res.status}`;
-            if (res.status === 400 && lastErrMsg.includes("API key not valid")) {
-              throw new Error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.");
-            }
-            if (res.status === 403) {
-              throw new Error(`Google 프로젝트 권한 오류: ${lastErrMsg}`);
-            }
-          }
-        } catch (err) {
-          if (err.message && (err.message.includes("API 키") || err.message.includes("프로젝트 권한"))) {
-            throw err;
-          }
-          lastErrMsg = err.message || lastErrMsg;
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null);
+        const msg = errJson?.error?.message || `HTTP ${res.status}`;
+        if (res.status === 400) throw new Error("INVALID_KEY:" + msg);
+        if (res.status === 403) throw new Error("FORBIDDEN:" + msg);
+        // 403 SERVICE_DISABLED => API 미활성화
+        if (msg.includes("SERVICE_DISABLED") || msg.includes("has not been used")) {
+          throw new Error("API_DISABLED:" + msg);
         }
+        throw new Error("LIST_FAIL:" + msg);
       }
 
-      throw new Error(lastErrMsg || "사용 가능한 Gemini 모델을 찾을 수 없습니다.");
+      const data = await res.json();
+      const models = (data.models || []).filter(m =>
+        Array.isArray(m.supportedGenerationMethods) &&
+        m.supportedGenerationMethods.includes("generateContent")
+      );
+
+      if (models.length === 0) throw new Error("NO_MODELS:사용 가능한 모델이 없습니다.");
+
+      // 선호 모델 순서: 최신 flash → 최신 pro
+      const pref = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-2.0-flash-exp",
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-pro",
+        "gemini-1.0-pro",
+        "gemini-pro"
+      ];
+
+      for (const p of pref) {
+        const found = models.find(m => m.name.includes(p));
+        if (found) return found.name.replace(/^models\//, "");
+      }
+
+      return models[0].name.replace(/^models\//, "");
+    }
+
+    // JSON 파싱을 responseMimeType 없이도 안전하게 처리
+    function extractJsonFromText(rawText) {
+      let t = rawText.trim();
+      // 마크다운 코드블록 제거
+      t = t.replace(/^```(?:json)?\s*/im, "").replace(/\s*```$/im, "").trim();
+      // 앞뒤 불필요 텍스트 제거 (첫 { 부터 마지막 } 까지)
+      const start = t.indexOf("{");
+      const end = t.lastIndexOf("}");
+      if (start !== -1 && end !== -1) t = t.slice(start, end + 1);
+      return JSON.parse(t);
     }
 
     async function callGeminiApi(apiKey, userQuery, selectedMode) {
       const trimmedKey = (apiKey || "").trim();
       if (!trimmedKey) throw new Error("API 키가 비어 있습니다.");
 
+      // 모델 자동 감지 (캐시)
+      if (!state.activeModel) {
+        try {
+          state.activeModel = await detectAvailableModel(trimmedKey);
+        } catch (e) {
+          const msg = e.message || "";
+          if (msg.startsWith("INVALID_KEY:")) throw new Error("API 키가 올바르지 않습니다.");
+          if (msg.startsWith("FORBIDDEN:") || msg.startsWith("API_DISABLED:")) {
+            throw new Error(
+              "Google 프로젝트에 Gemini API가 활성화되어 있지 않습니다.\n" +
+              "aistudio.google.com/apikey 에서 [Create API key in NEW project]로 새 키를 발급받아 주세요."
+            );
+          }
+          // fallback: 하드코딩 모델 목록으로 한 번 더 시도
+          state.activeModel = null;
+        }
+      }
+
       const modeHint = selectedMode === "auto"
         ? "사용자의 질문에서 세계관을 자동 진단해 가장 적합한 역할을 선택하세요."
         : `사용자가 요청한 변증 모드(${selectedMode})의 관점을 우선 반영하세요.`;
 
-      const payload = {
-        systemInstruction: {
-          parts: [{ text: SYSTEM_PROMPT_FOR_GEMINI }]
-        },
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: `[모드 지침: ${modeHint}]\n\n사용자 질문: ${userQuery}` }]
-          }
-        ],
-        generationConfig: {
-          temperature: 0.7,
-          responseMimeType: "application/json"
-        }
-      };
+      // responseMimeType 없는 기본 payload (모든 모델 호환)
+      const makePayload = () => ({
+        systemInstruction: { parts: [{ text: SYSTEM_PROMPT_FOR_GEMINI }] },
+        contents: [{
+          role: "user",
+          parts: [{ text: `[모드 지침: ${modeHint}]\n\n사용자 질문: ${userQuery}` }]
+        }],
+        generationConfig: { temperature: 0.7 }
+      });
 
-      // 타겟 모델 목록 구성 (자동 감지된 모델 우선 + fallback)
-      const targets = [];
-      if (state.activeModelTarget) {
-        targets.push(state.activeModelTarget);
-      } else {
-        try {
-          const detected = await detectAndValidateGeminiModel(trimmedKey);
-          if (detected) {
-            state.activeModelTarget = detected;
-            targets.push(detected);
-          }
-        } catch (e) {
-          console.warn("자동 모델 감지 실패:", e);
-        }
-      }
-
-      const fallbacks = [
-        { apiVersion: "v1beta", modelName: "gemini-1.5-flash-latest" },
-        { apiVersion: "v1beta", modelName: "gemini-1.5-flash" },
-        { apiVersion: "v1beta", modelName: "gemini-2.0-flash" },
-        { apiVersion: "v1", modelName: "gemini-1.5-flash" },
-        { apiVersion: "v1beta", modelName: "gemini-1.5-pro" },
-        { apiVersion: "v1beta", modelName: "gemini-pro" }
+      // 시도할 모델 목록
+      const tryModels = [];
+      if (state.activeModel) tryModels.push(state.activeModel);
+      const hardcoded = [
+        "gemini-2.0-flash",
+        "gemini-2.0-flash-lite",
+        "gemini-1.5-flash-latest",
+        "gemini-1.5-flash",
+        "gemini-1.5-pro",
+        "gemini-1.0-pro",
+        "gemini-pro"
       ];
-
-      for (const fb of fallbacks) {
-        if (!targets.some(t => t.apiVersion === fb.apiVersion && t.modelName === fb.modelName)) {
-          targets.push(fb);
-        }
+      for (const m of hardcoded) {
+        if (!tryModels.includes(m)) tryModels.push(m);
       }
 
       let lastError = null;
 
-      for (const target of targets) {
+      for (const model of tryModels) {
         try {
-          const url = `https://generativelanguage.googleapis.com/${target.apiVersion}/models/${target.modelName}:generateContent?key=${encodeURIComponent(trimmedKey)}`;
+          const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(trimmedKey)}`;
           const res = await fetch(url, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(makePayload())
           });
 
           if (!res.ok) {
             const errJson = await res.json().catch(() => null);
             const errMsg = errJson?.error?.message || `HTTP ${res.status}`;
-            console.warn(`[Gemini API] ${target.apiVersion}/${target.modelName} 실패:`, errMsg);
-            lastError = new Error(errMsg);
+            console.warn(`[Gemini] ${model} 실패:`, errMsg);
 
-            if (res.status === 400 && errMsg.includes("API key not valid")) {
-              throw new Error(`API 키 인증 실패: ${errMsg}`);
+            // 키 오류 / 서비스 미활성화는 즉시 중단
+            if (errMsg.includes("API key not valid") || errMsg.includes("INVALID_ARGUMENT")) {
+              throw new Error("API 키가 올바르지 않습니다. 키를 다시 확인해주세요.");
             }
-            if (res.status === 403) {
-              throw new Error(`프로젝트 접근 오류: ${errMsg}`);
+            if (errMsg.includes("SERVICE_DISABLED") || errMsg.includes("has not been used") || res.status === 403) {
+              throw new Error(
+                "Google 프로젝트에 Gemini API가 비활성화 상태입니다.\n" +
+                "aistudio.google.com/apikey 에서 [Create API key in NEW project]로 새 키를 발급받아 주세요."
+              );
             }
-            continue;
+
+            lastError = new Error(errMsg);
+            continue; // 다음 모델 시도
           }
 
           const data = await res.json();
           const rawText = data?.candidates?.[0]?.content?.parts?.[0]?.text;
-          if (!rawText) throw new Error("모델에서 빈 응답이 반환되었습니다.");
-
-          let cleanText = rawText.trim();
-          if (cleanText.startsWith("```")) {
-            cleanText = cleanText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
+          if (!rawText) {
+            console.warn(`[Gemini] ${model}: 빈 응답`);
+            lastError = new Error("빈 응답");
+            continue;
           }
 
-          const parsed = JSON.parse(cleanText);
-          state.activeModelTarget = target;
+          const parsed = extractJsonFromText(rawText);
+          state.activeModel = model; // 성공 모델 캐시
           return { isCrisis: false, ...parsed };
+
         } catch (err) {
           lastError = err;
-          if (err.message && (err.message.includes("API 키 인증 실패") || err.message.includes("프로젝트 접근 오류"))) {
+          // 복구 불가 에러는 즉시 throw
+          if (err.message && (
+            err.message.includes("API 키가 올바르지") ||
+            err.message.includes("비활성화 상태")
+          )) {
             throw err;
           }
         }
       }
 
-      throw lastError || new Error("Gemini API 호출에 실패했습니다.");
+      throw lastError || new Error("모든 Gemini 모델 호출에 실패했습니다.");
     }
 
     // =========================================================================
@@ -735,7 +734,7 @@
       activeCategory: "all",
       selectedMode: "auto",
       apiKey: "",
-      activeModelTarget: null,
+      activeModel: null,
       isLoading: false
     };
 
@@ -990,9 +989,9 @@
             result = await callGeminiApi(state.apiKey, q, state.selectedMode);
           } catch (apiErr) {
             console.error("Gemini API Error:", apiErr);
-            const errMsg = apiErr?.message || "알 수 없는 오류";
-            const shortMsg = errMsg.length > 35 ? errMsg.slice(0, 35) + "..." : errMsg;
-            showToast(`API 오류 (${shortMsg}): 내장 엔진으로 응답합니다.`);
+            // 모델 캐시 초기화 (다음 시도에서 재감지)
+            state.activeModel = null;
+            showToast("API 연결 실패 — 내장 변증 엔진으로 응답합니다.");
             result = diagnoseAndBuildResponse(q, state.selectedMode);
           }
         } else {
@@ -1090,7 +1089,7 @@
 
       if (!inputKey) {
         state.apiKey = "";
-        state.activeModelTarget = null;
+        state.activeModel = null;
         try { localStorage.removeItem("gemini_apologetics_key"); } catch (_) {}
         updateApiBadge();
         apiModalEl.classList.add("hidden");
@@ -1103,26 +1102,37 @@
       saveBtn.innerHTML = "<span>연결 확인 중...</span>";
       if (apiKeyStatusEl) {
         apiKeyStatusEl.className = "text-xs py-1.5 px-2.5 rounded-lg bg-blue-50 text-blue-700 block";
-        apiKeyStatusEl.textContent = "Google API 서버와 연결 및 모델 확인 중...";
+        apiKeyStatusEl.textContent = "Google API 서버와 연결 및 사용 가능한 모델 확인 중...";
       }
 
       try {
-        const detected = await detectAndValidateGeminiModel(inputKey);
+        const detectedModel = await detectAvailableModel(inputKey);
         state.apiKey = inputKey;
-        state.activeModelTarget = detected;
+        state.activeModel = detectedModel;
         try { localStorage.setItem("gemini_apologetics_key", inputKey); } catch (_) {}
         updateApiBadge();
         if (apiKeyStatusEl) apiKeyStatusEl.className = "hidden";
         apiModalEl.classList.add("hidden");
         apiModalEl.classList.remove("flex");
-        showToast(`Gemini API 연결 성공! (${detected.modelName})`);
+        showToast(`Gemini API 연결 성공! (${detectedModel})`);
       } catch (err) {
         console.error("API 키 검증 실패:", err);
+        const rawMsg = (err.message || "").replace(/^[A-Z_]+:/, "");
+        const isDisabled = rawMsg.includes("비활성화") || rawMsg.includes("has not been used") || rawMsg.includes("SERVICE_DISABLED");
+
         if (apiKeyStatusEl) {
           apiKeyStatusEl.className = "text-xs py-1.5 px-2.5 rounded-lg bg-rose-50 text-rose-700 block leading-relaxed border border-rose-200";
-          apiKeyStatusEl.innerHTML = `⚠️ <b>연결 실패:</b> ${err.message}`;
+          if (isDisabled) {
+            apiKeyStatusEl.innerHTML =
+              `⚠️ <b>Gemini API 미활성화 오류</b><br>` +
+              `현재 사용 중인 Google Cloud 프로젝트에 Gemini API가 꺼져 있습니다.<br><br>` +
+              `✅ <b>해결 방법:</b> <a href="https://aistudio.google.com/apikey" target="_blank" class="underline font-semibold">aistudio.google.com/apikey</a> 에서 ` +
+              `<b>[Create API key in <u>new project</u>]</b> 버튼을 선택해 새 키를 발급받아 주세요.`;
+          } else {
+            apiKeyStatusEl.innerHTML = `⚠️ <b>연결 실패:</b> ${rawMsg}`;
+          }
         }
-        showToast("API 연결에 실패했습니다. 모달 안내를 확인해주세요.");
+        showToast("API 연결 실패 — 모달 안내를 확인해주세요.");
       } finally {
         saveBtn.disabled = false;
         saveBtn.innerHTML = "<span>연결 및 저장</span>";
